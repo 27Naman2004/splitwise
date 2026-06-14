@@ -20,6 +20,8 @@ public class BalanceResponse {
         private UUID userId;
         private String name;
         private String email;
+        private BigDecimal totalPaid;
+        private BigDecimal totalOwed;
         private BigDecimal netBalance; // positive means they are owed money, negative means they owe money
     }
 }

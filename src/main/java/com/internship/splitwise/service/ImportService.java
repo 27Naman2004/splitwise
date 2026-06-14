@@ -14,6 +14,7 @@ import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 @Service
@@ -37,18 +38,28 @@ public class ImportService {
         Group group = groupRepository.findById(groupId)
                 .orElseThrow(() -> new IllegalArgumentException("Group not found with ID: " + groupId));
 
+        // Read file stream to string
+        String fileContent;
+        try {
+            fileContent = new String(fileStream.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to read file contents", e);
+        }
+
         // 1. Create a staged ImportJob
         ImportJob job = ImportJob.builder()
                 .uploadedBy(uploader)
+                .group(group)
                 .fileName(fileName)
                 .status("PROCESSING")
+                .fileContent(fileContent)
                 .createdAt(LocalDateTime.now())
                 .build();
         job = importJobRepository.save(job);
 
         try {
             // 2. Parse CSV rows
-            List<CSVRowDTO> parsedRows = csvParser.parse(fileStream);
+            List<CSVRowDTO> parsedRows = csvParser.parse(new java.io.ByteArrayInputStream(fileContent.getBytes(java.nio.charset.StandardCharsets.UTF_8)));
 
             // 3. Detect anomalies
             List<ImportIssue> issues = validationService.detectAnomalies(parsedRows, job);
@@ -79,6 +90,86 @@ public class ImportService {
             importJobRepository.save(job);
             throw new RuntimeException("Failed to process CSV import: " + e.getMessage(), e);
         }
+    }
+
+    @Transactional
+    public ImportJobResponse resolveAndCommit(UUID jobId, AnomalyResolutionRequest request) {
+        ImportJob job = importJobRepository.findById(jobId)
+                .orElseThrow(() -> new IllegalArgumentException("Import job not found with ID: " + jobId));
+
+        if (!"PENDING_RESOLUTION".equals(job.getStatus())) {
+            throw new IllegalStateException("Import job is not in PENDING_RESOLUTION state");
+        }
+
+        List<ImportIssue> issues = importIssueRepository.findByImportJobId(jobId);
+        Map<UUID, AnomalyResolutionRequest.SingleResolution> resolutionMap = request.getResolutions().stream()
+                .collect(Collectors.toMap(AnomalyResolutionRequest.SingleResolution::getAnomalyId, r -> r));
+
+        // Update issue actions
+        for (ImportIssue issue : issues) {
+            AnomalyResolutionRequest.SingleResolution res = resolutionMap.get(issue.getId());
+            if (res != null) {
+                issue.setActionTaken(res.getAction());
+                importIssueRepository.save(issue);
+            }
+        }
+
+        // Re-parse the CSV rows
+        List<CSVRowDTO> parsedRows;
+        try {
+            parsedRows = csvParser.parse(new java.io.ByteArrayInputStream(job.getFileContent().getBytes(java.nio.charset.StandardCharsets.UTF_8)));
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to re-parse CSV rows", e);
+        }
+
+        // Filter and modify rows based on resolutions
+        List<CSVRowDTO> finalRows = new ArrayList<>();
+        Map<Integer, List<ImportIssue>> rowIssues = issues.stream()
+                .collect(Collectors.groupingBy(ImportIssue::getRowNumber));
+
+        for (CSVRowDTO row : parsedRows) {
+            List<ImportIssue> rowAnomalies = rowIssues.getOrDefault(row.getRowNumber(), Collections.emptyList());
+            
+            boolean exclude = false;
+            String payerOverride = null;
+            String currencyOverride = null;
+
+            for (ImportIssue issue : rowAnomalies) {
+                AnomalyResolutionRequest.SingleResolution res = resolutionMap.get(issue.getId());
+                if (res != null) {
+                    if ("EXCLUDE".equalsIgnoreCase(res.getAction())) {
+                        exclude = true;
+                    } else if ("RESOLVE_PAYER".equalsIgnoreCase(res.getAction()) && res.getCustomData() != null) {
+                        payerOverride = (String) res.getCustomData().get("paidBy");
+                    } else if ("RESOLVE_CURRENCY".equalsIgnoreCase(res.getAction()) && res.getCustomData() != null) {
+                        currencyOverride = (String) res.getCustomData().get("currency");
+                    } else if ("MAP_USER".equalsIgnoreCase(res.getAction()) && res.getCustomData() != null) {
+                        payerOverride = (String) res.getCustomData().get("mappedName");
+                    }
+                }
+            }
+
+            if (exclude) {
+                continue;
+            }
+
+            if (payerOverride != null && !payerOverride.trim().isEmpty()) {
+                row.setPaidBy(payerOverride);
+            }
+            if (currencyOverride != null && !currencyOverride.trim().isEmpty()) {
+                row.setCurrency(currencyOverride);
+            }
+
+            finalRows.add(row);
+        }
+
+        // Commit remaining rows
+        commitStagedRows(finalRows, job.getGroup(), job);
+
+        job.setStatus("COMPLETED");
+        importJobRepository.save(job);
+
+        return mapToResponse(job, issues);
     }
 
     private void commitStagedRows(List<CSVRowDTO> rows, Group group, ImportJob job) {

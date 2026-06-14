@@ -76,3 +76,13 @@ This document lists the architectural, design, and algorithmic decisions made du
 * **Rationale**:
   * To show a high-fidelity audit report, the UI must display the exact string that was malformed (e.g., the row content containing `"1,200"` or `Mar-14`).
   * By preserving the raw text at the parsing stage, we can bind it directly to the `ImportIssue` record under `original_data` without needing to re-read the file during UI rendering.
+
+---
+
+## 10. JWT Authentication & REST Security
+* **Decision**: Spring Security 6.x + Stateless JWT Authentication (JJWT 0.12.x) + BCrypt Password Hashing.
+* **Rationale**:
+  * **BCrypt**: Industry-standard, slow-hashing algorithm that secures passwords against brute-force attacks.
+  * **JJWT 0.12.x**: Lightweight library implementing secure HS256-signed bearer tokens.
+  * **Statelessness**: REST APIs perform calculations per-request. Disabling cookies and session states (JSESSIONID) improves API scalability and prevents Cross-Site Request Forgery (CSRF) vulnerabilities.
+

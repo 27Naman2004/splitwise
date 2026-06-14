@@ -22,6 +22,14 @@ public class ImportJob {
     @JoinColumn(name = "uploaded_by")
     private User uploadedBy;
 
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "group_id")
+    private Group group;
+
+    @Lob
+    @Column(name = "file_content", columnDefinition = "TEXT")
+    private String fileContent;
+
     @Column(name = "file_name", nullable = false)
     private String fileName;
 
