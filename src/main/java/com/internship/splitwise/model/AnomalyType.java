@@ -1,0 +1,11 @@
+package com.internship.splitwise.model;
+
+public enum AnomalyType {
+    DUPLICATE_EXPENSE,
+    ENTITY_NAME_INCONSISTENCY,
+    MISSING_FIELD,
+    INVALID_DATE,
+    CURRENCY_INCONSISTENCY,
+    SPLIT_PERCENTAGE_IMBALANCE,
+    INACTIVE_MEMBER_SPLIT
+}
