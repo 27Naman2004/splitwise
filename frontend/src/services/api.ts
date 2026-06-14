@@ -1,7 +1,9 @@
 import axios from 'axios';
 
 const api = axios.create({
-  baseURL: '', // Empty base URL, relies on Vite proxy configuration in development
+  // In production (Vercel), VITE_API_BASE_URL points to the Render backend.
+  // In local dev, it's empty and Vite proxy handles the /api/* forwarding.
+  baseURL: import.meta.env.VITE_API_BASE_URL || '',
 });
 
 // Interceptor to inject bearer token
