@@ -1,101 +1,217 @@
-# Project Scope: Splitwise Clone & Anomaly Detector
+# SCOPE.md — Anomaly Log & Database Schema
 
 ## 1. Project Overview
-This project is an advanced expense management system designed to import, audit, and reconcile shared expenses from group living or travel. It addresses a real-world scenario where multiple roommates (Aisha, Rohan, Priya, Meera, Sam, Dev, etc.) have recorded transactions over several months, resulting in data quality issues, inconsistent formats, overlapping dates, and currency variations (INR and USD).
 
-The application parses the export, flags data anomalies, provides an interactive interface to clean and resolve them, calculates net balances, and executes a debt simplification algorithm to show the minimum number of transactions needed to settle all accounts.
+This project is a full-stack expense management system that imports, audits, and reconciles shared expense ledgers. The CSV provided represents 6+ months of roommate expenses (Aisha, Rohan, Priya, Meera, Sam, Dev) with intentionally embedded data quality problems across 10 anomaly categories.
+
+The application stages every CSV row before committing it to the live ledger. Every anomaly is flagged with a severity level (`CRITICAL`, `WARNING`, `INFO`), stored in the `import_issues` table, and presented in an interactive audit wizard for resolution.
 
 ---
 
 ## 2. Discovered CSV Anomalies
 
-The following specific anomalies were discovered in the `Expenses Export.csv` file and form the core test cases for the validation engine:
+The following anomalies were found in `expenses_export.csv` and form the core test cases for the `ValidationService`:
 
-1. **Duplicate Expenses**:
-   * Exact duplication of "Dinner at Marina Bites" on `08-02-2026` for ₹3,200 paid by Dev (Lines 5 and 6).
-   * Conflicting double-log for "Dinner at Thalassa" / "Thalassa dinner" on `11-03-2026` (Line 24 vs 25), with differing amounts (₹2,400 by Aisha vs ₹2,450 by Rohan).
-2. **Entity Name Inconsistencies**:
-   * Payer casing: `priya` (Line 9) vs `Priya`.
-   * Trailing space and casing: `rohan ` (Line 27) vs `Rohan`.
-   * Name variant suffix: `Priya S` (Line 11) vs `Priya`.
-3. **Missing Fields**:
-   * Missing payer: "House cleaning supplies" (Line 13) has `paid_by` empty.
-   * Missing currency: "Groceries DMart" (Line 28) has `currency` empty.
-   * Missing split type: "Rohan paid Aisha back" (Line 14) has `split_type` empty.
-4. **Invalid & Ambiguous Dates**:
-   * Non-standard format: "Airport cab" (Line 27) date is `Mar-14` (missing year, name format).
-   * Sequence/ambiguity issue: "Deep cleaning service" (Line 34) date is `04-05-2026` but is placed between March 28 and April 1, with the note "is this April 5 or May 4? format is a mess".
-5. **Currency Inconsistencies**:
-   * Mixed currencies with `INR` (Indian Rupee) and `USD` (US Dollars) for Goa trip expenses (Lines 20, 21, 23, 26).
-6. **Numeric Precision & Negative Values**:
-   * Over-precision float: "Cylinder refill" (Line 10) amount is `899.995`.
-   * Negative amount (Refund): "Parasailing refund" (Line 26) amount is `-30` (USD).
-   * Zero amount: "Dinner order Swiggy" (Line 31) amount is `0`.
-7. **Settlements Mixed with Expenses**:
-   * Peer-to-peer payback: "Rohan paid Aisha back" (Line 14) for ₹5,000.
-   * Security deposit: "Sam deposit share" (Line 38) for ₹15,000 paid to Aisha.
-8. **Percentage Split Integrity**:
-   * "Pizza Friday" (Line 15) and "Weekend brunch" (Line 32) split percentages sum to `110%` (`Aisha 30%; Rohan 30%; Priya 30%; Meera 20%`).
-9. **Participant Inconsistencies**:
-   * Inactive roommate split: "Groceries BigBasket" on `02-04-2026` (Line 36) includes Meera in the split, even though she moved out on March 29 (per Line 33 farewell dinner note).
-   * Temporary participant addition: "Parasailing" (Line 23) splits with `Dev's friend Kabir` who is not a regular group member.
-10. **Redundant Configurations**:
-    * "Furniture for common room" (Line 42) lists `split_type` as `equal`, but includes redundant share breakdowns (`Aisha 1; Rohan 1; Priya 1; Sam 1`).
+### Category 1 — Duplicate Expenses
+| Line | Description | Finding | Severity |
+|------|-------------|---------|----------|
+| 5 & 6 | "Dinner at Marina Bites" on 08-02-2026 for ₹3,200 by Dev | Exact duplicate row | CRITICAL |
+| 24 & 25 | "Dinner at Thalassa" / "Thalassa dinner" on 11-03-2026 | Conflicting duplicate — different amounts (₹2,400 vs ₹2,450) and different payers (Aisha vs Rohan) | CRITICAL |
+
+**How handled**: `ValidationService.checkDuplicates()` groups rows by `(date, description_normalized, amount)`. Exact matches are flagged CRITICAL. Near-matches (same date & description, different amount) flagged WARNING. User resolves via "Keep One / Keep Both" wizard.
+
+### Category 2 — Entity Name Inconsistencies (Name Variants)
+| Line | Raw Value | Expected | Severity |
+|------|-----------|---------|----------|
+| 9 | `priya` | `Priya` | WARNING |
+| 11 | `Priya S` | `Priya` | WARNING |
+| 27 | `rohan ` | `Rohan` | WARNING |
+
+**How handled**: `ValidationService.checkNameConsistency()` normalizes all names to title-case and trims whitespace. Fuzzy matching (Levenshtein distance ≤ 2) detects variants. Flagged as WARNING with suggested canonical name.
+
+### Category 3 — Missing Fields
+| Line | Expense | Missing Field | Severity |
+|------|---------|---------------|----------|
+| 13 | "House cleaning supplies" | `paid_by` empty | CRITICAL |
+| 28 | "Groceries DMart" | `currency` empty | WARNING |
+| 14 | "Rohan paid Aisha back" | `split_type` empty | WARNING |
+
+**How handled**: Missing `paid_by` → CRITICAL (cannot split without payer). Missing `currency` → WARNING, auto-assumed INR. Missing `split_type` → WARNING, settlement-type rows flagged for reclassification.
+
+### Category 4 — Invalid & Ambiguous Dates
+| Line | Raw Date | Problem | Severity |
+|------|----------|---------|----------|
+| 27 | `Mar-14` | Missing year, non-standard format | INFO |
+| 34 | `04-05-2026` | Ambiguous — April 5 or May 4? Out of sequence with surrounding March rows | WARNING |
+
+**How handled**: `CSVParser` attempts 3 date format patterns (`dd-MM-yyyy`, `MM-dd-yyyy`, `MMM-dd`). Ambiguous dates flagged INFO with detected format shown. Year-less dates assume current year.
+
+### Category 5 — Currency Inconsistencies
+| Lines | Currencies Found | Problem |
+|-------|-----------------|---------|
+| 20, 21, 23, 26 | INR and USD mixed | Goa trip expenses in both currencies — requires conversion for balance calculation |
+
+**How handled**: `CurrencyController` maintains exchange rates. USD amounts converted to INR at configured rate (default 83.00) before being added to net balance calculations. Original currency and original amount stored for display.
+
+### Category 6 — Numeric Precision & Negative Values
+| Line | Value | Problem | Severity |
+|------|-------|---------|----------|
+| 10 | `899.995` | 3 decimal places — rounding ambiguity (rounds to ₹900 or ₹899.99?) | INFO |
+| 26 | `-30 USD` | Negative amount — refund scenario | INFO |
+| 31 | `0` | Zero amount — "Dinner order Swiggy" | WARNING |
+
+**How handled**: Values rounded to 2 decimal places on ingest. Negative amounts treated as refunds (credited back to split participants). Zero amounts flagged WARNING — likely a data entry error.
+
+### Category 7 — Settlements Mixed with Expenses
+| Line | Entry | Problem | Severity |
+|------|-------|---------|----------|
+| 14 | "Rohan paid Aisha back" ₹5,000 | This is a P2P payment, not a shared expense — should not be split | WARNING |
+| 38 | "Sam deposit share" ₹15,000 to Aisha | Security deposit payback, not a group expense | WARNING |
+
+**How handled**: `ValidationService.detectSettlements()` uses keyword matching ("paid back", "deposit", "refund", "transfer") to flag settlement-type rows. User confirms reclassification in wizard → stored in `settlements` table, not `expenses`.
+
+### Category 8 — Percentage Split Integrity
+| Line | Expense | Percentages | Problem | Severity |
+|------|---------|------------|---------|----------|
+| 15 | "Pizza Friday" | Aisha 30% + Rohan 30% + Priya 30% + Meera 20% = 110% | Sum exceeds 100% | CRITICAL |
+| 32 | "Weekend brunch" | Same breakdown = 110% | Sum exceeds 100% | CRITICAL |
+
+**How handled**: `PercentageSplitStrategy.validate()` sums all percentages and throws `InvalidSplitException` if not within ±0.01 of 100. Flagged CRITICAL — user must rescale (normalize to 100%) or manually edit percentages in the wizard.
+
+### Category 9 — Participant Inconsistencies (Inactive Member)
+| Line | Expense | Problem | Severity |
+|------|---------|---------|----------|
+| 36 | "Groceries BigBasket" 02-04-2026 | Meera in split — but farewell dinner (Line 33) on 29-03-2026 indicates she moved out | WARNING |
+| 23 | "Parasailing" | Includes "Dev's friend Kabir" — temporary external participant | WARNING |
+
+**How handled**: Membership timeline tracked via `GroupMember` entity with `joinedAt`/`leftAt` timestamps. `ValidationService.checkMembershipActive()` flags any split with a member whose `leftAt` is before the expense date.
+
+### Category 10 — Redundant Split Configuration
+| Line | Expense | Problem | Severity |
+|------|---------|---------|----------|
+| 42 | "Furniture for common room" | `split_type = equal` but also includes explicit share breakdown `(Aisha 1; Rohan 1; Priya 1; Sam 1)` | INFO |
+
+**How handled**: Flagged INFO — the explicit shares are redundant when split is EQUAL. Redundant data is ignored; EQUAL strategy distributes evenly.
 
 ---
 
-## 3. Functional Requirements
+## 3. Database Schema
 
-### 3.1. CSV Data Ingestion & Anomaly Auditing
-> [!NOTE]
-> **Status**: **Backend Implemented**. The `CSVParser` state-machine and `ValidationService` rules engine have been implemented.
-* **File Ingest**: Drag-and-drop or select file interface for CSV uploads.
-* **Format Parsing**: Robust parser capable of handling:
-  * Comma-separated fields with quoted fields containing commas (e.g. `"1,200"`).
-  * Missing fields (empty payer or currency).
-  * Different date formats (`DD-MM-YYYY` vs `Month-DD` vs `MM-DD-YYYY`).
-* **Audit Dashboard**: Before importing, display a comprehensive audit report of all issues categorized by severity:
-  * **Critical**: Unparseable rows, missing split members, invalid split details (e.g., percentages summing to 110% instead of 100%), missing payers.
-  * **Warning**: Inconsistent names (e.g., "priya" vs "Priya"), currency missing (auto-assumed INR), potential duplicates (same day, same amount, or conflicting duplicate logs), split with inactive members (e.g., Meera after she moved out).
-  * **Info**: Non-standard date formats (e.g., `Mar-14`), negative amounts (refunds), floating-point precision issues (3 decimal places).
+### Entity Relationship Overview
 
-### 3.2. Interactive Resolution Wizard (Data Cleansing)
-Rather than failing or silently skipping bad data, the app guides the user through an interactive workflow to fix issues:
-* **Entity Resolution**: Map casing and spelling variants (e.g. "rohan ", "Rohan" -> "Rohan"; "Priya S", "priya", "Priya" -> "Priya").
-* **Payer Assignment**: Assign a payer to transactions missing `paid_by` (e.g. Line 13 "House cleaning supplies").
-* **Currency Resolution**: Assign default currency to transactions missing `currency` (e.g. Line 28 DMart).
-* **Ratio Normalization**: Recalculate or scale percentage splits that do not sum to 100% (e.g. 110% splits in lines 15 and 32), or let the user edit the weights.
-* **Duplicate Resolver**: Show suspected duplicates side-by-side (e.g., Dinner at Marina Bites, Dinner at Thalassa) and let the user keep one, merge them, or approve both.
-* **Settlement Identifier**: Reclassify transactions marked as expenses that are actually direct payments (e.g., "Rohan paid Aisha back") so they do not get split again.
+```
+users ─────────────────┐
+  │                    │
+  │ (paid_by)          │ (member)
+  ↓                    ↓
+expenses          group_members ← groups
+  │                    
+  ↓                    
+expense_splits (owes_user_id → users)
+  
+import_jobs ─────────────────→ import_issues
+  │
+  ↓ (on commit)
+expenses + expense_splits
 
-### 3.3. Expense Management (CRUD)
-* **View Transactions**: Search, sort (by date, amount, description), and filter (by payer, currency, date range) all transactions.
-* **Create/Update/Delete**: Manually log new expenses or edit/delete existing ones.
-* **Settle Up Creator**: Log a direct settlement between two users (e.g., "Aisha paid Priya ₹1,000") to update balances.
+settlements (payer_id → users, payee_id → users)
 
-### 3.4. Debt Minimization & Settlements Engine
-* **Net Balance Calculator**: Compute the net balance of each user in a base currency (default: INR).
-* **Exchange Rate Engine**: Convert USD transactions to INR using a customizable exchange rate (default: 1 USD = 83 INR).
-* **Transaction Minimizer (Greedy Flow)**: Implement a debt simplification algorithm (Splitwise algorithm) that outputs the optimal, minimized set of transfers needed to resolve all debts.
-* **Interactive Settlement Checklist**: Let users mark simplified transactions as "Settled", updating balances dynamically.
+exchange_rates
+```
 
-### 3.5. Analytics & Visualizations
-* **Group Metrics**: Total spent, average expense, distribution of spending by person.
-* **Visual Charts**: Beautiful SVG-based dashboard charts (pie chart for category breakdown, line chart for spending trend over time).
-* **Timeline of Members**: Show active dates for roommates (e.g., Meera active Feb-March, Sam active April onwards) to contextualize splits.
+### Table Definitions
 
----
+#### `users`
+| Column | Type | Constraints |
+|--------|------|-------------|
+| `id` | UUID | PK |
+| `name` | VARCHAR(100) | NOT NULL |
+| `email` | VARCHAR(255) | NOT NULL, UNIQUE |
+| `password_hash` | VARCHAR(255) | NOT NULL |
+| `created_at` | TIMESTAMP | NOT NULL |
 
-## 4. Non-Functional Requirements
-* **Performance**: Browser-based parsing and calculation must execute in under 100ms for files under 10,000 rows.
-* **Security & Privacy**: All calculations and files remain client-side; no financial data is uploaded to a remote server.
-* **Usability & Design**: Sleeek, modern, responsive glassmorphic dark-theme UI. Zero generic styles; custom typography (Google Fonts Outfit) and refined hover feedback.
-* **Data Persistence**: Automatic sync to browser `localStorage` so the user's progress is saved across page reloads.
+#### `groups`
+| Column | Type | Constraints |
+|--------|------|-------------|
+| `id` | UUID | PK |
+| `name` | VARCHAR(100) | NOT NULL |
+| `created_by` | UUID | FK → users.id |
+| `created_at` | TIMESTAMP | NOT NULL |
 
----
+#### `group_members`
+| Column | Type | Constraints |
+|--------|------|-------------|
+| `group_id` | UUID | PK (composite), FK → groups.id |
+| `user_id` | UUID | PK (composite), FK → users.id |
+| `joined_at` | TIMESTAMP | NOT NULL |
+| `left_at` | TIMESTAMP | nullable — NULL means still active |
 
-## 5. Out of Scope (For MVP 2-Day Timeline)
-* **Multi-group support**: The application assumes a single group space (roommates + trip).
-* **Live Exchange Rate APIs**: Exchange rates will be configurable manually in the settings, rather than fetching live rates (avoids API keys and CORS errors).
-* **User Authentication**: No login required; local-first user experience.
-* **OCR Receipt Scanning**: Adding expenses is done manually or via CSV.
+#### `expenses`
+| Column | Type | Constraints |
+|--------|------|-------------|
+| `id` | UUID | PK |
+| `group_id` | UUID | FK → groups.id |
+| `description` | VARCHAR(255) | NOT NULL |
+| `amount` | DECIMAL(12,2) | NOT NULL |
+| `currency` | VARCHAR(3) | NOT NULL, default 'INR' |
+| `amount_inr` | DECIMAL(12,2) | NOT NULL — converted amount |
+| `paid_by` | UUID | FK → users.id |
+| `split_type` | ENUM | EQUAL/UNEQUAL/PERCENTAGE/SHARES |
+| `expense_date` | DATE | NOT NULL |
+| `created_at` | TIMESTAMP | NOT NULL |
+
+#### `expense_splits`
+| Column | Type | Constraints |
+|--------|------|-------------|
+| `id` | UUID | PK |
+| `expense_id` | UUID | FK → expenses.id |
+| `owes_user_id` | UUID | FK → users.id |
+| `amount_owed` | DECIMAL(12,2) | NOT NULL |
+| `split_value` | DECIMAL(10,4) | percentage/shares value if applicable |
+
+#### `settlements`
+| Column | Type | Constraints |
+|--------|------|-------------|
+| `id` | UUID | PK |
+| `group_id` | UUID | FK → groups.id |
+| `payer_id` | UUID | FK → users.id |
+| `payee_id` | UUID | FK → users.id |
+| `amount` | DECIMAL(12,2) | NOT NULL |
+| `currency` | VARCHAR(3) | NOT NULL |
+| `settled_at` | TIMESTAMP | NOT NULL |
+| `note` | TEXT | nullable |
+
+#### `import_jobs`
+| Column | Type | Constraints |
+|--------|------|-------------|
+| `id` | UUID | PK |
+| `group_id` | UUID | FK → groups.id |
+| `uploaded_by` | UUID | FK → users.id |
+| `file_name` | VARCHAR(255) | NOT NULL |
+| `file_content` | TEXT | Full CSV stored for re-parse after resolution |
+| `status` | ENUM | STAGED / ISSUES_FOUND / COMMITTED / FAILED |
+| `row_count` | INTEGER | |
+| `issue_count` | INTEGER | |
+| `uploaded_at` | TIMESTAMP | NOT NULL |
+
+#### `import_issues`
+| Column | Type | Constraints |
+|--------|------|-------------|
+| `id` | UUID | PK |
+| `import_job_id` | UUID | FK → import_jobs.id |
+| `row_number` | INTEGER | CSV line number |
+| `anomaly_type` | ENUM | DUPLICATE / MISSING_PAYER / NAME_VARIANT / INVALID_DATE / etc. |
+| `severity` | ENUM | CRITICAL / WARNING / INFO |
+| `description` | TEXT | Human-readable explanation |
+| `original_data` | TEXT | Raw CSV row string |
+| `resolution_status` | ENUM | PENDING / RESOLVED / SKIPPED |
+| `resolution_note` | TEXT | nullable — what action was taken |
+
+#### `exchange_rates`
+| Column | Type | Constraints |
+|--------|------|-------------|
+| `id` | UUID | PK |
+| `from_currency` | VARCHAR(3) | NOT NULL |
+| `to_currency` | VARCHAR(3) | NOT NULL |
+| `rate` | DECIMAL(10,4) | NOT NULL |
+| `effective_date` | DATE | NOT NULL |
